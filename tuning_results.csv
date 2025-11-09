@@ -1,0 +1,1 @@
+diffusion.num_steps,diffusion.layers,diffusion.rank,train.epochs,RMSE,MAE,MSE

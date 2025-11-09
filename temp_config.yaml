@@ -1,0 +1,79 @@
+dataloader:
+  L_input: 64
+  L_pred: 12
+  batch_size: 4
+  conditional_masking:
+    block:
+      enabled: false
+      length_range:
+      - 5
+      - 10
+      target_missing_ratio: 0.05
+    full_node:
+      enabled: false
+      ratio: 0.1
+    random:
+      enabled: true
+      ratio: 0.05
+  preset_masking:
+    block:
+      enabled: false
+      length_range:
+      - 12
+      - 48
+      target_missing_ratio: 0.25
+    full_node:
+      enabled: true
+      ratio: 0.25
+    random:
+      enabled: false
+      ratio: 0.25
+    seed: 42
+  save_datasets: false
+  stride: 10
+dataset:
+  name: pm25
+diffusion:
+  beta_end: 0.2
+  beta_start: 0.001
+  channels: 64
+  diffusion_embedding_dim: 128
+  is_adp: true
+  is_cross_s: true
+  is_cross_t: true
+  layers: 2
+  nheads: 8
+  num_steps: 50
+  proj_t: 16
+  rank: 4
+  schedule: quad
+  tr_ranks: 2
+evaluation:
+  nsample: 1
+  probabilistic_eval: false
+global:
+  device: cpu
+  num_workers: 0
+  random_seed: 42
+  save_datasets: true
+model:
+  featureemb: 16
+  is_unconditional: false
+  target_strategy: hybrid
+  timeemb: 128
+  use_guide: true
+paths:
+  output_dir: ./processed_data
+  raw_data_dir: ./data
+preprocessing:
+  split_ratios:
+  - 0.7
+  - 0.1
+  - 0.2
+  use_provided_meanstd: false
+results:
+  save_final_results: true
+train:
+  epochs: 50
+  eval_interval: 5
+  learning_rate: 0.0001
