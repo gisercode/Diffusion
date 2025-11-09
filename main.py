@@ -157,7 +157,15 @@ def run_experiment(config, mode='full', model_path=None):
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
     print(f"TensorBoard 日志将保存至: {log_dir}")
-    
+
+    config_save_path = os.path.join(log_dir, 'config.yaml')
+    try:
+        with open(config_save_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+        print(f"配置文件已备份至: {config_save_path}")
+    except Exception as e:
+        print(f"警告: 保存配置文件失败: {e}")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=config['train']['learning_rate'])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3)
     epochs = config['train']['epochs']
