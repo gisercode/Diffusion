@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from dataloader import get_dataloader
+from src.dataloader import get_dataloader
 
 # 解决 OMP: Error #15, 允许多个 OpenMP 运行时库存在
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'

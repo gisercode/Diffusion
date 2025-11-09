@@ -29,6 +29,8 @@ class TimeSeriesDataset(Dataset):
         # 加载预处理数据
         processed_data = np.load(data_path)
         raw_data = torch.from_numpy(processed_data[f'{mode}_data']).float()
+        self.mean = torch.from_numpy(processed_data['mean']).float()
+        self.std = torch.from_numpy(processed_data['std']).float()
         
         self.N, self.T = raw_data.shape
         
@@ -394,7 +396,7 @@ def get_dataloader(config, mode, num_workers=None):
         num_workers=effective_num_workers
     )
     
-    return dataloader
+    return dataloader, dataset.mean, dataset.std
 
 
 if __name__ == '__main__':

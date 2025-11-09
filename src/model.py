@@ -4,7 +4,7 @@ import torch.nn as nn
 import torchcde
 from tqdm import tqdm
 # 假设 diff_models.py 存在于同一目录下或可通过 PYTHONPATH 访问
-from diff_models import Guide_diff
+from src.diff_models import Guide_diff
 
 
 class DiffuSDH(nn.Module):

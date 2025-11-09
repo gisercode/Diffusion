@@ -2,8 +2,8 @@ import torch
 import yaml
 import numpy as np
 import os
-from model import DiffuSDH
-from dataloader import get_dataloader
+from src.model import DiffuSDH
+from src.dataloader import get_dataloader
 
 def debug_data_pipeline():
     """

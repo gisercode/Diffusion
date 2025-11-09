@@ -117,15 +117,15 @@ evaluation:
 # 7. Diffusion 模型配置 (Diffusion Model Configuration)
 # --------------------------------------------------------------------------------------
 diffusion:
-  channels: 64           # CDE 输出通道数 (或扩散模型内部通道数) 64    diffusion.channels 和 diffusion.nheads的关系是diffusion.channels需要被nheads整除
-  diffusion_embedding_dim: 128 # 扩散模型嵌入维度 (根据 diff_models.py 补充)
+  channels: 16           # CDE 输出通道数 (或扩散模型内部通道数) 64    diffusion.channels 和 diffusion.nheads的关系是diffusion.channels需要被nheads整除
+  diffusion_embedding_dim: 32 # 扩散模型嵌入维度 (根据 diff_models.py 补充)
   num_steps: 100           # 扩散步数 100
   schedule: 'quad'      # Beta 调度策略 ('linear' 或 'quad')
   beta_start: 1.0e-3      # Beta 调度起始值
   beta_end: 0.02         # Beta 调度结束值 (修正：从 0.2 降低以防止数值爆炸)
   is_adp: true            # 是否使用自适应图卷积
   layers: 4               # 扩散模型层数
-  nheads: 8               # 多头注意力头数
+  nheads: 4               # 多头注意力头数
   proj_t: 16              # 时间投影维度
   rank: 8                # 用于低秩近似的秩 (rank)
   is_cross_t: true
@@ -135,14 +135,15 @@ diffusion:
 # 8. 结果保存配置 (Results Saving Configuration)
 # --------------------------------------------------------------------------------------
 results:
-  save_final_results: true # true: 保存最终的预测结果; false: 不保存
+  save_dir: './results'      # 评估结果保存目录
+  log_dir: './results/logs'  # TensorBoard 日志保存目录
 
-# 8. 全局设置 (Global Settings)
+# 9. 全局设置 (Global Settings)
 # --------------------------------------------------------------------------------------
 global:
   random_seed: 42  # 随机种子，确保数据集划分和随机掩码生成的可复现性
-  device: 'cuda'   # 计算设备选择，'cuda' 或 'cpu'
-  num_workers: 4 # DataLoader的子进程数量，0表示不使用子进程
+  device: 'cpu'   # 计算设备选择，'cuda' 或 'cpu'
+  num_workers: 1 # DataLoader的子进程数量，0表示不使用子进程
   save_datasets: fasle # 是否保存训练集、验证集和测试集到文件
 
 

@@ -1,21 +1,38 @@
 import os
 import sys
 import yaml
-import argparse
-import torch
-import numpy as np
-import pickle
 import time
-import glob
-import re
+import argparse
+import numpy as np
 from tqdm import tqdm
 
-# 将项目根目录添加到 Python 路径
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-from dataloader import get_dataloader
-from model import DiffuSDH
-from evaluate import evaluate
+# 假设你的模块在 src/ 目录下
+from src.dataloader import get_dataloader
+from src.model import DiffuSDH
+
+
+def inverse_transform(data, mean, std):
+    """
+    反标准化函数 (TENSOR version)
+    假设 data 是 (..., N, L) 维的张量，mean/std 是 (N,) 维的张量。
+    """
+    # 将 mean 和 std 移动到 data 所在的设备
+    mean = mean.to(data.device)
+    std = std.to(data.device)
+    
+    # 创建 (1, ..., 1, N, 1) 的形状用于广播
+    shape = [1] * data.dim()
+    shape[-2] = -1 # 对应 N (features) 维度
+    
+    mean_expanded = mean.view(shape)
+    std_expanded = std.view(shape)
+    
+    return data * std_expanded + mean_expanded
+
 
 def load_config(config_path):
     """加载YAML配置文件"""
@@ -23,172 +40,244 @@ def load_config(config_path):
         config = yaml.safe_load(f)
     return config
 
-def run_experiment(config, evaluate_only=False, quick_eval=False):
+
+def run_experiment(config, mode='full', model_path=None):
     """
-    执行一次完整的模型训练、验证和评估流程，并返回评估结果。
+    执行一次完整的模型训练、验证和评估流程。
+
+    :param config: 配置字典
+    :param mode: 运行模式 ('train', 'test', 'full')
+    :param model_path: 'test' 模式下要加载的模型路径
     """
     print("======================================================")
-    print("             DiffuSDH 模型实验")
+    print(f"             DiffuSDH 模型实验 (模式: {mode.upper()})")
     print("======================================================")
 
-    # 1. 检查并创建模型保存目录
-    dataset_name = config['dataset']['name']
-    model_save_dir = os.path.join('models', dataset_name)
-    os.makedirs(model_save_dir, exist_ok=True)
-
-    run_timestamp = time.strftime('%Y%m%d%H%M%S')
-    print(f"本次运行ID (时间戳): {run_timestamp}")
-    model_filename = f'best_model_{run_timestamp}.pth'
-    model_save_path = os.path.join(model_save_dir, model_filename)
-    
-    print(f"\n模型将保存至: {model_save_path}")
-
-    # 结果保存路径
-    results_save_dir = os.path.join('results', dataset_name)
-    os.makedirs(results_save_dir, exist_ok=True)
-    results_filename = f"{dataset_name}_{run_timestamp}.npz"
-    results_save_path = os.path.join(results_save_dir, results_filename)
-
-    # 2. 加载数据和 scaler
-    output_dir = config['paths']['output_dir']
-    processed_data_path = os.path.join(output_dir, f'{dataset_name}_processed.npz')
-    scaler_path = os.path.join(config['paths']['raw_data_dir'], dataset_name, f'{dataset_name.split("_")[0]}_meanstd.pk')
-
-    if not os.path.exists(processed_data_path):
-        raise FileNotFoundError(f"预处理数据文件未找到: {processed_data_path}")
-
-    try:
-        with open(scaler_path, 'rb') as f:
-            scaler_data = pickle.load(f)
-            mean_scaler = scaler_data[0]
-            scaler = scaler_data[1]
-        print(f"成功加载 Scaler: {scaler_path}")
-    except FileNotFoundError:
-        print(f"[警告] Scaler 文件未找到: {scaler_path}。评估指标将基于归一化数据。")
-        scaler, mean_scaler = 1.0, 0.0
-
-    # 3. 创建 DataLoader
-    train_loader = get_dataloader(config, 'train')
-    val_loader = get_dataloader(config, 'val')
-    test_loader = get_dataloader(config, 'test')
-
-    # 4. 实例化模型
-    first_batch = next(iter(train_loader))
-    _, N, L = first_batch['observed_data'].shape
+    # --- 1. 设备和 Dataloader 设置 ---
     device = torch.device(config["global"]["device"] if torch.cuda.is_available() else "cpu")
-    model = DiffuSDH(target_dim=N, seq_len=L, config=config, device=device).to(device)
     print(f"使用设备: {device}")
 
-    if not evaluate_only:
-        optimizer = torch.optim.Adam(model.parameters(), lr=config['train']['learning_rate'])
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3, verbose=True)
-        epochs = config['train']['epochs']
-        best_val_loss = float('inf')
+    # 在 'train' 或 'full' 模式下，需要 train/val loader
+    if mode in ['train', 'full']:
+        train_loader, _, _ = get_dataloader(config, 'train')
+        val_loader, _, _ = get_dataloader(config, 'val')
+        # 从 train_loader 获取 N, L
+        first_batch = next(iter(train_loader))
+        _, N, L = first_batch['observed_data'].shape
+    
+    # 总是需要 test_loader 来获取 mean/std
+    # 在 'test' 模式下，也用它来获取 N, L
+    test_loader, mean_tensor, std_tensor = get_dataloader(config, 'test')
+    
+    if mode == 'test':
+        # 如果是 'test' 模式，从 test_loader 获取 N, L
+        first_batch = next(iter(test_loader))
+        _, N, L = first_batch['observed_data'].shape
 
-        print(f"\n开始训练，共 {epochs} 个 epochs...")
+    # --- 2. 实例化模型 ---
+    model = DiffuSDH(target_dim=N, seq_len=L, config=config, device=device).to(device)
+
+    # --- 3. 模式特定逻辑 ---
+
+    # =========================
+    # 模式: 仅测试 (TEST)
+    # =========================
+    if mode == 'test':
+        print(f"\n正在从 {model_path} 加载模型...")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        print("模型加载成功。")
+        print("开始在测试集上评估 (不记录 TensorBoard)...")
+        
+        model.eval()
+        all_rmse, all_mse, all_mae = [], [], []
+        
+        with tqdm(total=len(test_loader), desc="[测试]", ncols=100, unit="batch") as pbar:
+            with torch.no_grad():
+                for batch_no, test_batch in enumerate(test_loader, start=1):
+                    output = model.evaluate(test_batch, config['evaluation']['nsample'])
+                    
+                    # output 是 Tensors
+                    samples, observed_data, eval_points, _, _ = output
+                    
+                    # 反标准化 (使用 Tensors)
+                    samples_original_tensor = inverse_transform(samples, mean_tensor, std_tensor)
+                    observed_original_tensor = inverse_transform(observed_data, mean_tensor, std_tensor)
+                    
+                    # 转换为 Numpy 用于评估
+                    samples_original = samples_original_tensor.detach().cpu().numpy()
+                    observed_original = observed_original_tensor.detach().cpu().numpy()
+                    eval_points = eval_points.detach().cpu().numpy()
+                    
+                    # 只选择需要评估的位置
+                    eval_mask = eval_points.astype(bool)
+                    pred_eval = samples_original[eval_mask]
+                    true_eval = observed_original[eval_mask]
+                    
+                    # 计算指标
+                    mse = mean_squared_error(true_eval, pred_eval)
+                    rmse = np.sqrt(mse)
+                    mae = mean_absolute_error(true_eval, pred_eval)
+                    
+                    all_rmse.append(rmse); all_mse.append(mse); all_mae.append(mae)
+                    pbar.set_postfix({
+                        'Batch': f'{batch_no}/{len(test_loader)}',
+                        'RMSE': f'{np.mean(all_rmse):.4f}', 
+                        'MAE': f'{np.mean(all_mae):.4f}'
+                    })
+                    pbar.update(1)
+        
+        final_rmse = np.mean(all_rmse)
+        final_mse = np.mean(all_mse)
+        final_mae = np.mean(all_mae)
+
+        print("\n--- 测试结果 (Test-Only Mode) ---")
+        print(f"Final RMSE: {final_rmse:.4f}")
+        print(f"Final MAE: {final_mae:.4f}")
+        print(f"Final MSE: {final_mse:.4f}")
+        
+        return # 结束函数
+
+    # =========================
+    # 模式: 训练+验证 / 完整
+    # =========================
+    
+    # --- 4. 训练设置 (仅 'train' 和 'full' 模式) ---
+    dataset_name = config['dataset']['name']
+    model_save_dir = config['results']['save_dir']
+    os.makedirs(model_save_dir, exist_ok=True)
+    
+    run_timestamp = time.strftime('%Y%m%d%H%M%S')
+    print(f"本次运行ID (时间戳): {run_timestamp}")
+    model_filename = f'{dataset_name}_{run_timestamp}.pth'
+    model_save_path = os.path.join(model_save_dir, model_filename)
+    print(f"\n模型将保存至: {model_save_path}")
+
+    # 5. 日志记录器
+    log_dir = os.path.join(config['results']['log_dir'], dataset_name, run_timestamp)
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir)
+    print(f"TensorBoard 日志将保存至: {log_dir}")
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['train']['learning_rate'])
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3)
+    epochs = config['train']['epochs']
+    best_val_loss = float('inf')
+    
+    print(f"\n开始训练，共 {epochs} 个 epochs...")
+    
+    # 调整 pbar 的 total_step
+    steps_per_epoch = len(train_loader) + len(val_loader)
+    if mode == 'full':
+        steps_per_epoch += len(test_loader)
+    total_step = steps_per_epoch * epochs
+
+    final_metrics_log = {}
+
+    with tqdm(total=total_step, desc=f"[训练]", ncols=150, unit="batch") as pbar:
         for epoch in range(epochs):
+            
+            # --- 训练 ---
             model.train()
             total_train_loss = 0
-            with tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs} [训练]", ncols=100, unit="batch") as pbar:
-                for batch in train_loader:
-                    optimizer.zero_grad()
-                    loss = model(batch, is_train=1)
-                    loss.backward()
-                    # --- 解决梯度爆炸问题 ---
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    total_train_loss += loss.item()
-                    pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
-                    pbar.update(1)
+            pbar.set_description(f"[训练 Epoch {epoch+1}/{epochs}]")
+            for (j, batch) in enumerate(train_loader, 1):
+                optimizer.zero_grad()
+                train_loss = model(batch, is_train=1)
+                train_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_train_loss += train_loss.item()
+                avg_train_loss = total_train_loss / j
+                writer.add_scalar('Train/Batch_Loss', train_loss.item(), epoch * len(train_loader) + j)
+                pbar.set_postfix({'Loss': f'{avg_train_loss:.4f}'})
+                pbar.update(1)
+            writer.add_scalar('Train/Epoch_Loss', avg_train_loss, epoch + 1)
+            writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
             
+            # --- 验证 ---
             model.eval()
             total_val_loss = 0
+            pbar.set_description(f"[验证 Epoch {epoch+1}/{epochs}]")
             with torch.no_grad():
-                for batch in val_loader:
+                for j, batch in enumerate(val_loader, 1):
                     val_loss = model(batch, is_train=0)
                     total_val_loss += val_loss.item()
-            
-            avg_train_loss = total_train_loss / len(train_loader)
-            avg_val_loss = total_val_loss / len(val_loader)
-            print(f"Epoch {epoch+1}/{epochs} | 平均训练损失: {avg_train_loss:.4f} | 验证损失: {avg_val_loss:.4f} | 当前学习率: {optimizer.param_groups[0]['lr']:.6f}")
-
+                    avg_val_loss = total_val_loss / j
+                    writer.add_scalar('Validation/Batch_Loss', val_loss.item(), epoch * len(val_loader) + j)
+                    pbar.set_postfix({'Val_Loss': f'{avg_val_loss:.4f}'})
+                    pbar.update(1)
+            writer.add_scalar('Validation/Epoch_Loss', avg_val_loss, epoch + 1)
             scheduler.step(avg_val_loss)
-
+            
+            # --- 保存最佳模型 ---
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 torch.save(model.state_dict(), model_save_path)
-                print(f"  -> 验证损失提升，已保存最佳模型至 {model_save_path}")
-        
-        print("\n训练完成！")
+                pbar.set_description(f"[验证 Epoch {epoch+1}] (新最佳)")
+            
+            # --- 测试 (仅 'full' 模式) ---
+            if mode == 'full':
+                model.eval()
+                all_rmse, all_mse, all_mae = [], [], []
+                pbar.set_description(f"[测试 Epoch {epoch+1}/{epochs}]")
+                with torch.no_grad():
+                    for batch_no, test_batch in enumerate(test_loader, start=1):
+                        output = model.evaluate(test_batch, config['evaluation']['nsample'])
+                        
+                        # Tensors
+                        samples, observed_data, eval_points, _, _ = output
+                        
+                        # 反标准化 (Tensors)
+                        samples_original_tensor = inverse_transform(samples, mean_tensor, std_tensor)
+                        observed_original_tensor = inverse_transform(observed_data, mean_tensor, std_tensor)
 
-    else:
-        print("\n跳过训练过程。")
-        # 在仅评估模式下，需要一个预训练模型路径
-        # 为简化调优脚本，我们假设每次都从头训练
-        print("[警告] 仅评估模式需要预训练模型，但调优流程会从头训练。")
+                        # Numpy
+                        samples_original = samples_original_tensor.detach().cpu().numpy()
+                        observed_original = observed_original_tensor.detach().cpu().numpy()
+                        eval_points = eval_points.detach().cpu().numpy()
+                        
+                        eval_mask = eval_points.astype(bool)
+                        pred_eval = samples_original[eval_mask]
+                        true_eval = observed_original[eval_mask]
+                        
+                        mse = mean_squared_error(true_eval, pred_eval)
+                        rmse = np.sqrt(mse)
+                        mae = mean_absolute_error(true_eval, pred_eval)
+                        
+                        all_rmse.append(rmse); all_mse.append(mse); all_mae.append(mae)
+                        pbar.set_postfix({
+                            'Test_RMSE': f'{np.mean(all_rmse):.4f}',
+                            'Test_MAE': f'{np.mean(all_mae):.4f}'
+                        })
+                        pbar.update(1)
+                
+                final_rmse = np.mean(all_rmse)
+                final_mse = np.mean(all_mse)
+                final_mae = np.mean(all_mae)
+                
+                writer.add_scalar('Test/Epoch_RMSE', final_rmse, epoch + 1)
+                writer.add_scalar('Test/Epoch_MSE', final_mse, epoch + 1)
+                writer.add_scalar('Test/Epoch_MAE', final_mae, epoch + 1)
+                
+                # 记录最后一次的指标
+                final_metrics_log = {
+                    "RMSE": final_rmse,
+                    "MAE": final_mae,
+                    "MSE": final_mse
+                }
+            writer.flush()
 
-
-    # 7. 最终评估
-    print("\n开始在测试集上进行最终评估...")
-
-    # 在 evaluate_only 模式下，查找最新的模型
-    if evaluate_only:
-        model_dir = os.path.join('models', dataset_name)
-        list_of_files = glob.glob(os.path.join(model_dir, 'best_model_*.pth'))
-        if not list_of_files:
-            print(f"[错误] 在 {model_dir} 中没有找到任何模型文件。")
-            return -1, -1, -1
-        
-        # 解析文件名中的时间戳并找到最新的文件
-        latest_file = max(list_of_files, key=lambda f: re.search(r'best_model_(\d+).pth', f).group(1))
-        model_load_path = latest_file
-        print(f"检测到 --evaluate_only 模式，将加载最新的模型: {model_load_path}")
-    else:
-        # 在训练模式下，加载本次训练保存的最佳模型
-        model_load_path = model_save_path
-        if not os.path.exists(model_load_path):
-            print(f"[错误] 模型文件 {model_load_path} 不存在。无法进行评估。")
-            return -1, -1, -1
-        print(f"加载本次训练的最佳模型: {model_load_path}")
-
-    model.load_state_dict(torch.load(model_load_path, map_location=device))
+    writer.close()
+    print(f"\n训练/验证完成。最佳模型已保存至: {model_save_path}")
     
-    eval_config = config.get('evaluation', {})
-    probabilistic_eval = eval_config.get('probabilistic_eval', False)
-    nsample = eval_config.get('nsample', 1)
-
-    if quick_eval:
-        print("\n[提示] 已启用快速评估模式，将覆盖配置文件的评估设置。")
-        probabilistic_eval = False
-        nsample = 1
-
-    # 在调优脚本中，我们不保存评估结果文件
-    # evaluate函数现在可能返回3个或5个值，为安全起见，进行切片处理
-    # 根据配置决定是否保存结果
-    should_save_results = config.get('results', {}).get('save_final_results', False)
-    final_results_save_path = results_save_path if should_save_results else None
-
-    eval_results = evaluate(
-        model,
-        test_loader,
-        device=device,
-        probabilistic_eval=probabilistic_eval,
-        nsample=nsample,
-        scaler=scaler,
-        mean_scaler=mean_scaler,
-        results_save_path=final_results_save_path,
-        dataset_name=dataset_name
-    )
-    final_rmse, final_mae, final_mse = eval_results[:3]
-    
-    print("\n评估完成！")
-    
-    # 仅在非仅评估模式下删除本次训练的临时模型
-    if not evaluate_only and os.path.exists(model_save_path):
-        os.remove(model_save_path)
-        print(f"已删除临时模型: {model_save_path}")
-
-    return final_rmse, final_mae, final_mse
+    if mode == 'full':
+        print("\n--- 最终测试结果 (Full Mode, Last Epoch) ---")
+        print(f"Final RMSE: {final_metrics_log.get('RMSE', 'N/A'):.4f}")
+        print(f"Final MAE: {final_metrics_log.get('MAE', 'N/A'):.4f}")
+        print(f"Final MSE: {final_metrics_log.get('MSE', 'N/A'):.4f}")
+    elif mode == 'train':
+        print("\n--- 训练/验证完成 (Train Mode) ---")
+        print("未运行测试集。")
 
 
 def main():
@@ -201,27 +290,32 @@ def main():
         help='配置文件路径'
     )
     parser.add_argument(
-        '--evaluate_only',
-        action='store_true',
-        help='跳过训练，直接在测试集上评估现有模型 (在调优脚本中不推荐使用)'
+        '--mode',
+        choices=['train', 'test', 'full'],
+        default='train',
+        help='运行模式: (train: 仅训练和验证, test: 仅测试, full: 训练、验证和测试)'
     )
     parser.add_argument(
-        '--quick_eval',
-        action='store_true',
-        help='启用快速评估模式，强制 nsample=1 并禁用概率性评估，覆盖配置文件中的设置。'
+        '--model_path',
+        type=str,
+        default=None,
+        help='预训练模型的路径 (在 "test" 模式下必需)'
     )
     args = parser.parse_args()
+
+    # 检查 'test' 模式的依赖
+    if args.mode == 'test' and args.model_path is None:
+        parser.error('--model_path 是 "test" 模式的必需参数')
+    
+    # 检查 'test' 模式下模型文件是否存在
+    if args.mode == 'test' and not os.path.exists(args.model_path):
+        parser.error(f'模型文件未找到: {args.model_path}')
 
     config = load_config(args.config)
     
     # 运行实验
-    rmse, mae, mse = run_experiment(config, args.evaluate_only, args.quick_eval)
+    run_experiment(config, args.mode, args.model_path)
 
-    # 为 hyperparam_tuning.py 提供可捕获的输出
-    print("\n--- 实验结果 ---")
-    print(f"Final RMSE: {rmse}")
-    print(f"Final MAE: {mae}")
-    print(f"Final MSE: {mse}")
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,9 @@
 import os
 import pickle
 import numpy as np
-from layers import *
-from gwnet import GWNet
-from generate_adj import *
+from src.layers import *
+from src.gwnet import GWNet
+from src.generate_adj import *
 from typing import Union
 
 
@@ -76,6 +76,8 @@ class Guide_diff(nn.Module):
                 aptinit=self.adj,
                 tr_ranks=config["tr_ranks"]
             )
+            
+
             self.cond_projection = Conv1d_with_init(config["side_dim"], self.itp_channels, 1)
             self.itp_projection2 = Conv1d_with_init(self.itp_channels, 1, 1)
 
@@ -162,7 +164,7 @@ class Guide_diff(nn.Module):
          itp_x = itp_x + itp_cond_info
          itp_x = itp_x.reshape(B, self.itp_channels, K, L)
          itp_x = self.itp_modeling(itp_x)
-         # itp_x = F.silu(itp_x) # 移除 SiLU 激活，让引导信号直接传递
+         itp_x = F.silu(itp_x) # 移除 SiLU 激活，让引导信号直接传递
 
      diffusion_emb = self.diffusion_embedding(diffusion_step)
 
